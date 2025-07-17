@@ -6,81 +6,153 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// Build the system prompt by embedding all FAQs
-function buildSystemPrompt() {
-  const docsFormatted = supportDocs.map(doc =>
-    `Q: ${doc.question}\nA: ${doc.answer}`
-  ).join('\n\n');
+// Utility to strip HTML tags from Zendesk latest_comment_html
+function stripHtmlTags(text) {
+  return text.replace(/<[^>]*>/g, '').trim();
+}
+
+// Build system prompt using knowledge base and ticket metadata
+function buildSystemPrompt(ticket) {
+  const docsFormatted = supportDocs.map(doc => `Q: ${doc.question}\nA: ${doc.answer}`).join('\n\n');
+
+  const requesterName = ticket.name || 'Customer';
+  const ticketSubject = ticket.subject || '(no subject)';
+  const ticketPriority = ticket.priority || '(no priority)';
+  const ticketTags = ticket.tags?.join(', ') || '(no tags)';
 
   return `
 You are a support agent for Hair for Hire, an app that helps customers book hairstylists for home or salon visits.
 
+The customer's name is ${requesterName}.
+Their ticket is about: "${ticketSubject}"
+Priority: ${ticketPriority}
+Tags: ${ticketTags}
+
 Here is our support knowledge base:
 ${docsFormatted}
 
-Using the above information, answer the customer's message as clearly and kindly as possible. If you do not have enough information, respond with your best helpful answer.
+Using the above information, professionally respond to the customer's message as clearly, kindly, and helpfully as possible. If you're unsure, give your best helpful response. Do not include any unverified information or sign off with a name.
   `.trim();
 }
 
+// Health check route
+app.get('/', (req, res) => {
+  res.send('✅ Hair for Hire AI bot is live!');
+});
+
+// Webhook route from Zendesk
 app.post('/webhook', async (req, res) => {
+  console.log('✅ Webhook endpoint hit!');
   try {
     const ticket = req.body.ticket || req.body;
     const ticketId = ticket.id;
-    const ticketText = ticket.description;
+    const requesterName = ticket.name || 'the customer';
+    const ticketSubject = ticket.subject;
 
-    const systemPrompt = buildSystemPrompt();
+    const rawComment = ticket.latest_comment || ticket.description || '';
+    const ticketText = stripHtmlTags(rawComment);
 
-    // Call OpenAI
+    const systemPrompt = buildSystemPrompt(ticket);
+
+    const userPrompt = `
+The following message was sent by ${requesterName}.
+
+Subject: ${ticketSubject}
+Message: ${ticketText}
+    `.trim();
+
+    console.log('--- SYSTEM PROMPT ---\n' + systemPrompt);
+    console.log('--- USER PROMPT ---\n' + userPrompt);
+
     const openaiRes = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
         model: 'gpt-4',
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Customer message: "${ticketText}"` }
-        ],
+          { role: 'user', content: userPrompt }
+        ]
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        }
       }
     );
 
     const aiReply = openaiRes.data.choices[0].message.content;
 
-    // Send reply to Zendesk
-    await axios.put(
+    const response = await axios.put(
       `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
       {
         ticket: {
           comment: {
             body: aiReply,
-            public: false, // Set to true if you want customer to see it immediately
-          },
-        },
+            public: true,
+            author_id: 37412595449115
+          }
+        }
       },
       {
         auth: {
           username: `${process.env.ZENDESK_EMAIL}/token`,
-          password: process.env.ZENDESK_API_TOKEN,
+          password: process.env.ZENDESK_API_TOKEN
         },
         headers: {
-          'Content-Type': 'application/json',
-        },
+          'Content-Type': 'application/json'
+        }
       }
     );
+    
+    console.log(response.data)
 
-    console.log(`AI reply sent to ticket #${ticketId}`);
+    console.log(`✅ AI reply sent to ticket #${ticketId}`);
     res.status(200).send('AI reply added');
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error('❌ Error details:', err.response?.data || err.message);
     res.status(500).send('Error processing ticket');
   }
 });
 
-app.listen(3000, () => console.log('Server running at http://localhost:3000'));
-// This server listens for incoming webhook requests from Zendesk,
-// processes the ticket using OpenAI's GPT-4 model, and sends the AI-generated response
-// back to Zendesk as a private comment on the ticket.
-// The support_docs.js file contains FAQs that are used to build the system prompt for the AI model.
+// Manual test route
+app.post('/test-openai', async (req, res) => {
+  try {
+    const userMessage = req.body.message;
+    if (!userMessage) {
+      return res.status(400).json({ error: 'Missing "message" in request body' });
+    }
+
+    const fakeTicket = {
+      name: 'Test User',
+      subject: 'Test Prompt',
+      priority: 'normal',
+      tags: ['test']
+    };
+
+    const systemPrompt = buildSystemPrompt(fakeTicket);
+
+    const openaiRes = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-4',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        }
+      }
+    );
+
+    const aiReply = openaiRes.data.choices[0].message.content;
+    res.status(200).json({ reply: aiReply });
+  } catch (err) {
+    console.error('❌ Error in /test-openai:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to get response from OpenAI' });
+  }
+});
+
+app.listen(3000, () => console.log('🚀 Server running at http://localhost:3000'));
