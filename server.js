@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const supportDocs = require('./support_docs');
+const generateZendeskJwt = require('./zendeskJwt');
 require('dotenv').config();
 
 const app = express();
@@ -82,30 +83,24 @@ Message: ${ticketText}
 
     const aiReply = openaiRes.data.choices[0].message.content;
 
-    const response = await axios.put(
-      `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
+    // ✅ Use Conversations API with JWT for public reply
+    const token = generateZendeskJwt();
+
+    const response = await axios.post(
+      `https://api.zendesk.com/v2/conversations/${ticketId}/messages`,
       {
-        ticket: {
-          comment: {
-            body: aiReply,
-            public: true
-          },
-          author_id: 37412595449115 // Must be a valid AGENT ID
-        }
+        type: "text",
+        text: aiReply,
+        direction: "outbound",
+        public: true
       },
       {
-        auth: {
-          username: `${process.env.ZENDESK_EMAIL}/token`,
-          password: process.env.ZENDESK_API_TOKEN
-        },
         headers: {
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json'
         }
       }
     );
-    
-    
-    console.log(response.data)
 
     console.log(`✅ AI reply sent to ticket #${ticketId}`);
     res.status(200).send('AI reply added');
