@@ -88,9 +88,9 @@ Message: ${ticketText}
         ticket: {
           comment: {
             body: aiReply,
-            public: true,
-            author_id: 37412595449115
-          }
+            public: true
+          },
+          author_id: 37412595449115 // Must be a valid AGENT ID
         }
       },
       {
@@ -103,6 +103,7 @@ Message: ${ticketText}
         }
       }
     );
+    
     
     console.log(response.data)
 
