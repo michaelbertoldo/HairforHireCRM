@@ -86,13 +86,14 @@ Message: ${ticketText}
     // ✅ Use Conversations API with JWT for public reply
     const token = generateZendeskJwt();
 
-    const response = await axios.post(
-      `https://api.zendesk.com/v2/conversations/${ticketId}/messages`,
+    await axios.post(
+      `https://api.zopim.com/v2/conversations/${ticketId}/messages`,
       {
-        type: "text",
-        text: aiReply,
-        direction: "outbound",
-        public: true
+        message: {
+          type: "text",
+          text: aiReply,
+          role: "agent"
+        }
       },
       {
         headers: {
@@ -100,7 +101,7 @@ Message: ${ticketText}
           'Content-Type': 'application/json'
         }
       }
-    );
+    )
 
     console.log(`✅ AI reply sent to ticket #${ticketId}`);
     res.status(200).send('AI reply added');

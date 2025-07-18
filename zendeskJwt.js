@@ -10,16 +10,13 @@ function generateZendeskJwt() {
     iss: appId,
     sub: keyId,
     iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 300 // valid for 5 minutes
+    exp: Math.floor(Date.now() / 1000) + 300 // 5 minutes
   };
 
-  const token = jwt.sign(payload, secret, {
+  return jwt.sign(payload, secret, {
     algorithm: 'HS256',
     header: { kid: keyId }
   });
-
-  return token;
 }
 
 module.exports = generateZendeskJwt;
-
