@@ -1,0 +1,17 @@
+{
+    "type": "conversation:message",
+    "payload": {
+      "conversation": {
+        "id": 81
+      },
+      "message": {
+        "content": {
+          "type": "text",
+          "text": "Hi, how do I book an appointment?"
+        },
+        "author": {
+          "userId": "user-456"
+        }
+      }
+    }
+  }

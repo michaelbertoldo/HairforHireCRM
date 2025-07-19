@@ -13,11 +13,17 @@ function verifySignature(req, res, buf) {
     .update(buf)
     .digest('hex');
 
-  const receivedSignature = req.header('X-Hub-Signature');
-  if (expectedSignature !== receivedSignature) {
+  const receivedHeader = req.header('X-Hub-Signature') || '';
+  const receivedSignature = receivedHeader.replace(/^sha256=/, '');
+
+  if (!crypto.timingSafeEqual(
+    Buffer.from(receivedSignature, 'utf8'),
+    Buffer.from(expectedSignature, 'utf8')
+  )) {
     throw new Error('Invalid webhook signature');
   }
 }
+
 
 function buildSystemPrompt(userMessage) {
   const docsFormatted = supportDocs.map(doc => `Q: ${doc.question}\nA: ${doc.answer}`).join('\n\n');
@@ -73,12 +79,16 @@ app.post('/webhook', async (req, res) => {
       text: aiReply
     },
     {
+      auth: {
+        username: process.env.ZENDESK_KEY_ID,   // Your Sunshine API key ID
+        password: process.env.ZENDESK_SECRET_KEY // Your Sunshine secret
+      },
       headers: {
-        Authorization: `Bearer ${process.env.ZENDESK_API_TOKEN}`,
         'Content-Type': 'application/json'
       }
     }
   );
+  
 
   res.sendStatus(200);
 });
