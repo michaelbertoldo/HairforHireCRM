@@ -66,85 +66,94 @@ app.post('/webhook', async (req, res) => {
   try {
     console.log('🔔 Webhook received:', JSON.stringify(req.body, null, 2));
     
-    const event = req.body;
-    
-    // Only process conversation messages
-    if (event.type !== 'conversation:message') {
-      console.log('⏭️ Skipping non-message event:', event.type);
+    // Handle real webhook format with events array
+    const webhookData = req.body;
+    if (!webhookData.events || !Array.isArray(webhookData.events)) {
+      console.log('⏭️ No events array found');
       return res.sendStatus(200);
     }
 
-    // CRITICAL: Skip messages from the bot itself to prevent loops
-    if (event.payload.message.author.type === 'appMaker') {
-      console.log('🤖 Skipping bot message to prevent loop');
-      return res.sendStatus(200);
+    // Process each event
+    for (const event of webhookData.events) {
+      // Only process conversation messages
+      if (event.type !== 'conversation:message') {
+        console.log('⏭️ Skipping non-message event:', event.type);
+        continue;
+      }
+
+      // CRITICAL: Skip messages from the bot itself to prevent loops
+      if (event.payload.message.author.type === 'appMaker') {
+        console.log('🤖 Skipping bot message to prevent loop');
+        continue;
+      }
+
+      const userMessage = event.payload.message?.content?.text;
+      const conversationId = event.payload.conversation.id;
+      const userId = event.payload.message.author.userId;
+
+      console.log('📝 Extracted data:', { userMessage, conversationId, userId });
+
+      if (!userMessage || !conversationId) {
+        console.log('❌ Missing required data');
+        continue;
+      }
+
+      // Build system prompt with support docs
+      const systemPrompt = buildSystemPrompt(userMessage);
+      console.log('📋 Built system prompt');
+
+      // Get AI response from OpenAI
+      console.log('🧠 Calling OpenAI...');
+      const openaiRes = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          model: 'gpt-4',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage }
+          ],
+          max_tokens: 500,
+          temperature: 0.7
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      const aiReply = openaiRes.data.choices[0].message.content;
+      console.log('✅ AI Reply generated:', aiReply);
+
+      // Send reply via Sunshine Conversations API
+      console.log('📤 Sending reply to Sunshine...');
+      await axios.post(
+        `https://api.smooch.io/v1.1/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+        {
+          author: {
+            type: 'appMaker',
+            displayName: 'Hair for Hire Support'
+          },
+          content: {
+            type: 'text',
+            text: aiReply
+          }
+        },
+        {
+          auth: {
+            username: process.env.ZENDESK_KEY_ID,
+            password: process.env.ZENDESK_SECRET_KEY
+          },
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      console.log('🎉 SUCCESS: AI response sent to user!');
     }
 
-    const userMessage = event.payload.message?.content?.text;
-    const conversationId = event.payload.conversation.id;
-    const userId = event.payload.message.author.userId;
-
-    console.log('📝 Extracted data:', { userMessage, conversationId, userId });
-
-    if (!userMessage || !conversationId) {
-      console.log('❌ Missing required data');
-      return res.sendStatus(400);
-    }
-
-    // Build system prompt with support docs
-    const systemPrompt = buildSystemPrompt(userMessage);
-    console.log('📋 Built system prompt');
-
-    // Get AI response from OpenAI
-    console.log('🧠 Calling OpenAI...');
-    const openaiRes = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage }
-        ],
-        max_tokens: 500,
-        temperature: 0.7
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    const aiReply = openaiRes.data.choices[0].message.content;
-    console.log('✅ AI Reply generated:', aiReply);
-
-    // Send reply via Sunshine Conversations API
-    console.log('📤 Sending reply to Sunshine...');
-    await axios.post(
-      `https://api.smooch.io/v1.1/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
-      {
-        author: {
-          type: 'appMaker',
-          displayName: 'Hair for Hire Support'
-        },
-        content: {
-          type: 'text',
-          text: aiReply
-        }
-      },
-      {
-        auth: {
-          username: process.env.ZENDESK_KEY_ID,
-          password: process.env.ZENDESK_SECRET_KEY
-        },
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    console.log('🎉 SUCCESS: AI response sent to user!');
     res.sendStatus(200);
     
   } catch (error) {
