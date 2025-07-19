@@ -82,7 +82,9 @@ app.post('/webhook', async (req, res) => {
       }
 
       // CRITICAL: Skip messages from the bot itself to prevent loops
-      if (event.payload.message.author.type === 'appMaker') {
+      if (event.payload.message.author.type === 'business' || 
+          event.payload.message.author.type === 'appMaker' ||
+          event.payload.message.author.displayName === 'Hair for Hire Support') {
         console.log('🤖 Skipping bot message to prevent loop');
         continue;
       }
