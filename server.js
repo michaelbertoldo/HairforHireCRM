@@ -1,155 +1,87 @@
 const express = require('express');
+const crypto = require('crypto');
 const axios = require('axios');
-const supportDocs = require('./support_docs');
-const generateZendeskJwt = require('./zendeskJwt');
 require('dotenv').config();
+const supportDocs = require('./support_docs');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ verify: verifySignature }));
 
-// Utility to strip HTML tags from Zendesk latest_comment_html
-function stripHtmlTags(text) {
-  return text.replace(/<[^>]*>/g, '').trim();
+function verifySignature(req, res, buf) {
+  const expectedSignature = crypto
+    .createHmac('sha256', process.env.ZENDESK_SHARED_SECRET)
+    .update(buf)
+    .digest('hex');
+
+  const receivedSignature = req.header('X-Hub-Signature');
+  if (expectedSignature !== receivedSignature) {
+    throw new Error('Invalid webhook signature');
+  }
 }
 
-// Build system prompt using knowledge base and ticket metadata
-function buildSystemPrompt(ticket) {
+function buildSystemPrompt(userMessage) {
   const docsFormatted = supportDocs.map(doc => `Q: ${doc.question}\nA: ${doc.answer}`).join('\n\n');
-
-  const requesterName = ticket.name || 'Customer';
-  const ticketSubject = ticket.subject || '(no subject)';
-  const ticketPriority = ticket.priority || '(no priority)';
-  const ticketTags = ticket.tags?.join(', ') || '(no tags)';
-
   return `
-You are a support agent for Hair for Hire, an app that helps customers book hairstylists for home or salon visits.
+You are a helpful support agent for Hair for Hire, an app that helps users book stylists.
 
-The customer's name is ${requesterName}.
-Their ticket is about: "${ticketSubject}"
-Priority: ${ticketPriority}
-Tags: ${ticketTags}
+Customer said: "${userMessage}"
 
-Here is our support knowledge base:
+Use the knowledge base below to write a clear and professional response:
+
 ${docsFormatted}
-
-Using the above information, professionally respond to the customer's message as clearly, kindly, and helpfully as possible. If you're unsure, give your best helpful response. Do not include any unverified information or sign off with a name.
   `.trim();
 }
 
-// Health check route
-app.get('/', (req, res) => {
-  res.send('✅ Hair for Hire AI bot is live!');
-});
-
-// Webhook route from Zendesk
 app.post('/webhook', async (req, res) => {
-  console.log('✅ Webhook endpoint hit!');
-  try {
-    const ticket = req.body.ticket || req.body;
-    const ticketId = ticket.id;
-    const requesterName = ticket.name || 'the customer';
-    const ticketSubject = ticket.subject;
+  const event = req.body;
 
-    const rawComment = ticket.latest_comment || ticket.description || '';
-    const ticketText = stripHtmlTags(rawComment);
+  if (event.type !== 'conversation:message') return res.sendStatus(200);
 
-    const systemPrompt = buildSystemPrompt(ticket);
+  const userMessage = event.payload.message?.content?.text;
+  const conversationId = event.payload.conversation.id;
+  const appUserId = event.payload.message.author.userId;
 
-    const userPrompt = `
-The following message was sent by ${requesterName}.
+  if (!userMessage || !conversationId) return res.sendStatus(400);
 
-Subject: ${ticketSubject}
-Message: ${ticketText}
-    `.trim();
+  const systemPrompt = buildSystemPrompt(userMessage);
 
-    console.log('--- SYSTEM PROMPT ---\n' + systemPrompt);
-    console.log('--- USER PROMPT ---\n' + userPrompt);
-
-    const openaiRes = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-        }
+  // Get AI reply
+  const openaiRes = await axios.post(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      model: 'gpt-4',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage }
+      ]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
       }
-    );
-
-    const aiReply = openaiRes.data.choices[0].message.content;
-
-    // ✅ Use Conversations API with JWT for public reply
-    const token = generateZendeskJwt();
-
-    await axios.post(
-      `https://api.zopim.com/v2/conversations/${ticketId}/messages`,
-      {
-        message: {
-          type: "text",
-          text: aiReply,
-          role: "agent"
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    )
-
-    console.log(`✅ AI reply sent to ticket #${ticketId}`);
-    res.status(200).send('AI reply added');
-  } catch (err) {
-    console.error('❌ Error details:', err.response?.data || err.message);
-    res.status(500).send('Error processing ticket');
-  }
-});
-
-// Manual test route
-app.post('/test-openai', async (req, res) => {
-  try {
-    const userMessage = req.body.message;
-    if (!userMessage) {
-      return res.status(400).json({ error: 'Missing "message" in request body' });
     }
+  );
 
-    const fakeTicket = {
-      name: 'Test User',
-      subject: 'Test Prompt',
-      priority: 'normal',
-      tags: ['test']
-    };
+  const aiReply = openaiRes.data.choices[0].message.content;
 
-    const systemPrompt = buildSystemPrompt(fakeTicket);
-
-    const openaiRes = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage }
-        ]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
-        }
+  // Send reply via Sunshine Conversations API
+  await axios.post(
+    `https://api.smooch.io/v1.1/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+    {
+      role: 'appMaker',
+      type: 'text',
+      text: aiReply
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.ZENDESK_API_TOKEN}`,
+        'Content-Type': 'application/json'
       }
-    );
+    }
+  );
 
-    const aiReply = openaiRes.data.choices[0].message.content;
-    res.status(200).json({ reply: aiReply });
-  } catch (err) {
-    console.error('❌ Error in /test-openai:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to get response from OpenAI' });
-  }
+  res.sendStatus(200);
 });
 
-app.listen(3000, () => console.log('🚀 Server running at http://localhost:3000'));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
