@@ -80,7 +80,7 @@ app.post('/webhook', async (req, res) => {
 
     // Send reply via Sunshine Conversations API
     await axios.post(
-      `https://api.${process.env.ZENDESK_REGION || 'smooch'}.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+      `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
       {
         role: 'appMaker',
         type: 'text',
