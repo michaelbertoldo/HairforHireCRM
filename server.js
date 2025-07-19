@@ -28,7 +28,7 @@ function verifySignature(req, res, buf) {
 }
 
 app.get('/', (req, res) => {
-  res.send('Webhook server is running!');
+  res.send('AI Chatbot server is running!');
 });
 
 function buildSystemPrompt(userMessage) {
@@ -46,23 +46,39 @@ ${docsFormatted}
 
 app.post('/webhook', async (req, res) => {
   try {
-    console.log('Webhook received:', JSON.stringify(req.body, null, 2));
+    console.log('🔔 Webhook received:', JSON.stringify(req.body, null, 2));
     
     const event = req.body;
-    if (event.type !== 'conversation:message') return res.sendStatus(200);
+    
+    // Only process conversation messages
+    if (event.type !== 'conversation:message') {
+      console.log('⏭️ Skipping non-message event:', event.type);
+      return res.sendStatus(200);
+    }
+
+    // CRITICAL: Skip messages from the bot itself to prevent loops
+    if (event.payload.message.author.type === 'appMaker') {
+      console.log('🤖 Skipping bot message to prevent loop');
+      return res.sendStatus(200);
+    }
 
     const userMessage = event.payload.message?.content?.text;
     const conversationId = event.payload.conversation.id;
+    const userId = event.payload.message.author.userId;
 
-    console.log('Extracted data:', { userMessage, conversationId });
+    console.log('📝 Extracted data:', { userMessage, conversationId, userId });
 
-    if (!userMessage || !conversationId) return res.sendStatus(400);
+    if (!userMessage || !conversationId) {
+      console.log('❌ Missing required data');
+      return res.sendStatus(400);
+    }
 
+    // Build system prompt with support docs
     const systemPrompt = buildSystemPrompt(userMessage);
-    console.log('Built system prompt');
+    console.log('📋 Built system prompt');
 
-    // Get AI reply from OpenAI
-    console.log('Calling OpenAI...');
+    // Get AI response from OpenAI
+    console.log('🧠 Calling OpenAI...');
     const openaiRes = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
@@ -70,29 +86,55 @@ app.post('/webhook', async (req, res) => {
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userMessage }
-        ]
+        ],
+        max_tokens: 500,
+        temperature: 0.7
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
         }
       }
     );
 
     const aiReply = openaiRes.data.choices[0].message.content;
     console.log('✅ AI Reply generated:', aiReply);
-    
-    // Skip Sunshine API call for now - just log what we would send
-    console.log('Would send to conversation:', conversationId);
-    console.log('✅ Webhook test successful!');
-    
+
+    // Send reply via Sunshine Conversations API
+    console.log('📤 Sending reply to Sunshine...');
+    await axios.post(
+      `https://api.smooch.io/v1.1/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+      {
+        author: {
+          type: 'appMaker',
+          displayName: 'Hair for Hire Support'
+        },
+        content: {
+          type: 'text',
+          text: aiReply
+        }
+      },
+      {
+        auth: {
+          username: process.env.ZENDESK_KEY_ID,
+          password: process.env.ZENDESK_SECRET_KEY
+        },
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log('🎉 SUCCESS: AI response sent to user!');
     res.sendStatus(200);
+    
   } catch (error) {
     console.error('❌ Webhook error:', error.message);
-    console.error('Full error:', error.response?.data || error);
+    console.error('📋 Error details:', error.response?.data || error);
     res.status(500).send('Internal server error');
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 AI Chatbot server running on port ${PORT}`));
