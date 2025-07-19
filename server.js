@@ -129,11 +129,10 @@ app.post('/webhook', async (req, res) => {
       // Send reply via Sunshine Conversations API
       console.log('📤 Sending reply to Sunshine...');
       await axios.post(
-        `https://api.smooch.io/v1.1/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+        `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
         {
           author: {
-            type: 'appMaker',
-            displayName: 'Hair for Hire Support'
+            type: 'business'
           },
           content: {
             type: 'text',
@@ -141,11 +140,8 @@ app.post('/webhook', async (req, res) => {
           }
         },
         {
-          auth: {
-            username: process.env.ZENDESK_KEY_ID,
-            password: process.env.ZENDESK_SECRET_KEY
-          },
           headers: {
+            'Authorization': `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
             'Content-Type': 'application/json'
           }
         }
