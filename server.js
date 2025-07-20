@@ -222,14 +222,42 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
+      // Check if conversation has live_agent_requested tag
+      console.log('🏷️ Checking for live agent tag...');
+      try {
+        const ticketRes = await axios.get(
+          `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket external_id:${conversationId}`,
+          {
+            timeout: 5000,
+            auth: {
+              username: `${process.env.ZENDESK_EMAIL}/token`,
+              password: process.env.ZENDESK_API_TOKEN
+            }
+          }
+        );
+
+        const tickets = ticketRes.data.results;
+        if (tickets && tickets.length > 0) {
+          const ticket = tickets[0];
+          if (ticket.tags && ticket.tags.includes('live_agent_requested')) {
+            console.log('🙋‍♂️ Live agent requested - skipping AI response');
+            continue;
+          }
+          console.log('✅ No live agent tag found - proceeding with AI response');
+        } else {
+          console.log('ℹ️ No associated ticket found - proceeding with AI response');
+        }
+      } catch (tagCheckError) {
+        console.log('⚠️ Error checking tags, proceeding with AI response:', tagCheckError.message);
+        // Continue with AI response if tag check fails
+      }
+
       // Build system prompt with support docs
       const systemPrompt = buildSystemPrompt(userMessage);
       console.log('📋 Built system prompt for message');
-
       // Get AI response from OpenAI with timeout
       console.log('🧠 Calling OpenAI API...');
       const openaiRes = await axios.post(
-        'https://api.openai.com/v1/chat/completions',
         {
           model: 'gpt-4',
           messages: [
