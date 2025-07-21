@@ -1,8 +1,37 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-require('dotenv').config();
+// require('dotenv').config(); // Not needed on Render - using environment variables directly
 const supportDocs = require('./support_docs');
+
+// Validate required environment variables (matching your Render setup)
+const requiredEnvVars = [
+  'OPENAI_API_KEY',
+  'ZENDESK_SHARED_SECRET',
+  'ZENDESK_SUBDOMAIN',
+  'ZENDESK_EMAIL',
+  'ZENDESK_API_TOKEN',
+  'ZENDESK_APP_ID',
+  'ZENDESK_KEY_ID',
+  'ZENDESK_SECRET_KEY'
+];
+
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+if (missingVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingVars);
+  console.error('🔧 Please set these in your Render dashboard');
+  process.exit(1);
+}
+
+console.log('✅ All required environment variables are set');
+
+// Debug environment variables (remove this after testing)
+console.log('🔍 Environment check:', {
+  hasOpenAI: !!process.env.OPENAI_API_KEY,
+  hasZendeskSecret: !!process.env.ZENDESK_SHARED_SECRET,
+  hasZendeskAppId: !!process.env.ZENDESK_APP_ID,
+  nodeEnv: process.env.NODE_ENV
+});
 
 const app = express();
 app.use(express.json({ verify: verifySignature }));
@@ -24,12 +53,18 @@ setInterval(() => {
     }
   }
   
-  // Clean duplicate detection data older than 1 minute
-  const oneMinuteAgo = now - 60000;
+  // Clean duplicate detection data older than 2 minutes (extended from 1 minute)
+  const twoMinutesAgo = now - 120000;
   for (const message of recentMessages) {
-    const messageTime = parseInt(message.split('_').pop());
-    if (messageTime < oneMinuteAgo) {
-      recentMessages.delete(message);
+    // Handle both ID-based and content-based keys
+    if (message.startsWith('id_')) {
+      // ID-based keys don't have timestamps, remove after 2 minutes
+      continue; // Keep these longer for reliability
+    } else {
+      const messageTime = parseInt(message.split('_').pop());
+      if (messageTime < twoMinutesAgo) {
+        recentMessages.delete(message);
+      }
     }
   }
 }, 300000); // Run every 5 minutes
@@ -84,6 +119,7 @@ function isBotMessage(message) {
     author.displayName?.includes('Bot') ||
     author.displayName?.includes('Hair for Hire Support') ||
     author.userId?.startsWith('bot_') ||
+    author.userId === process.env.ZENDESK_APP_ID || // Detect our own bot responses
     content?.text?.startsWith('[AUTO]') ||
     content?.text?.includes('🤖') // Bot emoji check
   );
@@ -107,15 +143,27 @@ function isRateLimited(userId) {
   return false;
 }
 
-// Message deduplication check
-function isDuplicateMessage(conversationId, userMessage) {
+// Enhanced duplicate detection with message ID
+function isDuplicateMessage(conversationId, userMessage, messageId) {
   const now = Date.now();
-  const messageKey = `${conversationId}_${userMessage.slice(0, 50)}_${Math.floor(now / 30000)}`; // 30-second window
   
-  if (recentMessages.has(messageKey)) {
+  // Check by message ID first (most reliable)
+  if (messageId && recentMessages.has(`id_${messageId}`)) {
+    console.log('🚫 Duplicate detected by message ID:', messageId);
     return true;
   }
   
+  // Fallback to content-based detection (60-second window)
+  const messageKey = `${conversationId}_${userMessage.slice(0, 50)}_${Math.floor(now / 60000)}`;
+  if (recentMessages.has(messageKey)) {
+    console.log('🚫 Duplicate detected by content');
+    return true;
+  }
+  
+  // Store both ID and content-based keys
+  if (messageId) {
+    recentMessages.add(`id_${messageId}`);
+  }
   recentMessages.add(messageKey);
   return false;
 }
@@ -216,8 +264,8 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
-      // Message deduplication check
-      if (isDuplicateMessage(conversationId, userMessage)) {
+      // Enhanced duplicate message detection
+      if (isDuplicateMessage(conversationId, userMessage, messageId)) {
         console.log('🚫 Duplicate message detected - skipping');
         continue;
       }
@@ -255,9 +303,11 @@ app.post('/webhook', async (req, res) => {
       // Build system prompt with support docs
       const systemPrompt = buildSystemPrompt(userMessage);
       console.log('📋 Built system prompt for message');
+      
       // Get AI response from OpenAI with timeout
       console.log('🧠 Calling OpenAI API...');
       const openaiRes = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
         {
           model: 'gpt-4',
           messages: [
@@ -268,13 +318,19 @@ app.post('/webhook', async (req, res) => {
           temperature: 0.7
         },
         {
-          timeout: 15000, // 15 second timeout
+          timeout: 15000,
           headers: {
             Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
             'Content-Type': 'application/json'
           }
         }
       );
+
+      // Add error handling for OpenAI response
+      if (!openaiRes.data?.choices?.[0]?.message?.content) {
+        console.error('❌ Invalid OpenAI response structure:', openaiRes.data);
+        throw new Error('Invalid OpenAI response - no content found');
+      }
 
       const aiReply = openaiRes.data.choices[0].message.content;
       console.log('✅ AI Reply generated successfully');
@@ -294,7 +350,7 @@ app.post('/webhook', async (req, res) => {
           }
         },
         {
-          timeout: 10000, // 10 second timeout
+          timeout: 10000,
           headers: {
             'Authorization': `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
             'Content-Type': 'application/json'
@@ -332,8 +388,9 @@ app.listen(PORT, () => {
   console.log('🛡️ Safety features enabled:');
   console.log('  ✅ Enhanced bot detection');
   console.log('  ✅ Rate limiting (5 msgs/min per user)');
-  console.log('  ✅ Message deduplication');
+  console.log('  ✅ Message deduplication (60s window)');
   console.log('  ✅ Circuit breaker (max 10 errors)');
   console.log('  ✅ Request timeouts');
   console.log('  ✅ Comprehensive logging');
+  console.log('  ✅ Environment variable validation');
 });
