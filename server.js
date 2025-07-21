@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-// require('dotenv').config(); // Not needed on Render - using environment variables directly
+require('dotenv').config(); // Keep this for local development with .env file
 const supportDocs = require('./support_docs');
 
 // Validate required environment variables (matching your Render setup)
@@ -19,8 +19,14 @@ const requiredEnvVars = [
 const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
 if (missingVars.length > 0) {
   console.error('❌ Missing required environment variables:', missingVars);
-  console.error('🔧 Please set these in your Render dashboard');
-  process.exit(1);
+  if (process.env.NODE_ENV === 'production') {
+    console.error('🔧 Please set these in your Render dashboard');
+    process.exit(1);
+  } else {
+    console.error('🔧 For local development, create a .env file with these variables');
+    console.error('🚨 Bot will not function without these variables!');
+    console.error('⚠️ Continuing anyway for development...');
+  }
 }
 
 console.log('✅ All required environment variables are set');
