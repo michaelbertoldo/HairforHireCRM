@@ -1,43 +1,8 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-require('dotenv').config(); // Keep this for local development with .env file
+require('dotenv').config();
 const supportDocs = require('./support_docs');
-
-// Validate required environment variables (matching your Render setup)
-const requiredEnvVars = [
-  'OPENAI_API_KEY',
-  'ZENDESK_SHARED_SECRET',
-  'ZENDESK_SUBDOMAIN',
-  'ZENDESK_EMAIL',
-  'ZENDESK_API_TOKEN',
-  'ZENDESK_APP_ID',
-  'ZENDESK_KEY_ID',
-  'ZENDESK_SECRET_KEY'
-];
-
-const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
-if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:', missingVars);
-  if (process.env.NODE_ENV === 'production') {
-    console.error('🔧 Please set these in your Render dashboard');
-    process.exit(1);
-  } else {
-    console.error('🔧 For local development, create a .env file with these variables');
-    console.error('🚨 Bot will not function without these variables!');
-    console.error('⚠️ Continuing anyway for development...');
-  }
-}
-
-console.log('✅ All required environment variables are set');
-
-// Debug environment variables (remove this after testing)
-console.log('🔍 Environment check:', {
-  hasOpenAI: !!process.env.OPENAI_API_KEY,
-  hasZendeskSecret: !!process.env.ZENDESK_SHARED_SECRET,
-  hasZendeskAppId: !!process.env.ZENDESK_APP_ID,
-  nodeEnv: process.env.NODE_ENV
-});
 
 const app = express();
 app.use(express.json({ verify: verifySignature }));
@@ -45,7 +10,6 @@ app.use(express.json({ verify: verifySignature }));
 // Safety measures - in-memory storage
 const userMessageCount = new Map();
 const recentMessages = new Set();
-const conversationChoices = new Set(); // Track conversations that have been shown the choice
 let errorCount = 0;
 const MAX_ERRORS = 10;
 
@@ -60,18 +24,12 @@ setInterval(() => {
     }
   }
   
-  // Clean duplicate detection data older than 2 minutes (extended from 1 minute)
-  const twoMinutesAgo = now - 120000;
+  // Clean duplicate detection data older than 1 minute
+  const oneMinuteAgo = now - 60000;
   for (const message of recentMessages) {
-    // Handle both ID-based and content-based keys
-    if (message.startsWith('id_')) {
-      // ID-based keys don't have timestamps, remove after 2 minutes
-      continue; // Keep these longer for reliability
-    } else {
-      const messageTime = parseInt(message.split('_').pop());
-      if (messageTime < twoMinutesAgo) {
-        recentMessages.delete(message);
-      }
+    const messageTime = parseInt(message.split('_').pop());
+    if (messageTime < oneMinuteAgo) {
+      recentMessages.delete(message);
     }
   }
 }, 300000); // Run every 5 minutes
@@ -126,7 +84,6 @@ function isBotMessage(message) {
     author.displayName?.includes('Bot') ||
     author.displayName?.includes('Hair for Hire Support') ||
     author.userId?.startsWith('bot_') ||
-    author.userId === process.env.ZENDESK_APP_ID || // Detect our own bot responses
     content?.text?.startsWith('[AUTO]') ||
     content?.text?.includes('🤖') // Bot emoji check
   );
@@ -150,59 +107,49 @@ function isRateLimited(userId) {
   return false;
 }
 
-// Enhanced duplicate detection with message ID
-function isDuplicateMessage(conversationId, userMessage, messageId) {
+// Message deduplication check
+function isDuplicateMessage(conversationId, userMessage) {
   const now = Date.now();
+  const messageKey = `${conversationId}_${userMessage.slice(0, 50)}_${Math.floor(now / 30000)}`; // 30-second window
   
-  // Check by message ID first (most reliable)
-  if (messageId && recentMessages.has(`id_${messageId}`)) {
-    console.log('🚫 Duplicate detected by message ID:', messageId);
-    return true;
-  }
-  
-  // Fallback to content-based detection (60-second window)
-  const messageKey = `${conversationId}_${userMessage.slice(0, 50)}_${Math.floor(now / 60000)}`;
   if (recentMessages.has(messageKey)) {
-    console.log('🚫 Duplicate detected by content');
     return true;
   }
   
-  // Store both ID and content-based keys
-  if (messageId) {
-    recentMessages.add(`id_${messageId}`);
-  }
   recentMessages.add(messageKey);
   return false;
 }
 
-// Function to send choice message with buttons
-async function sendChoiceMessage(conversationId) {
-  const messagePayload = {
-    author: {
-      type: 'business'
-    },
-    content: {
-      type: 'text',
-      text: "Hi! How would you like to get help today?",
-      actions: [
-        {
-          type: "postback",
-          text: "🤖 AI Assistant",
-          payload: "ai_assistant"
-        },
-        {
-          type: "postback",
-          text: "👤 Live Agent",
-          payload: "live_agent"
-        }
-      ]
-    }
-  };
+// Function to detect if user wants live agent
+function detectAgentRequest(userMessage) {
+  const message = userMessage.toLowerCase().trim();
+  
+  // Check for exact AGENT command or common variations
+  return (
+    message === 'agent' ||
+    message === 'live agent' ||
+    message === 'human' ||
+    message === 'person' ||
+    message.includes('speak with agent') ||
+    message.includes('talk to agent') ||
+    message.includes('live support') ||
+    message.includes('human help')
+  );
+}
 
+// Function to handle live agent request
+async function handleAgentRequest(conversationId) {
   try {
+    // Send confirmation message
     await axios.post(
       `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
-      messagePayload,
+      {
+        author: { type: 'business' },
+        content: { 
+          type: 'text', 
+          text: "I'm connecting you with a live agent. Someone will be with you shortly!" 
+        }
+      },
       {
         timeout: 10000,
         headers: {
@@ -211,23 +158,42 @@ async function sendChoiceMessage(conversationId) {
         }
       }
     );
-    console.log('✅ Choice message sent!');
     
-    // Mark this conversation as having received the choice
-    conversationChoices.add(conversationId);
+    // Add live agent tag to the ticket
+    const ticketRes = await axios.get(
+      `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket external_id:${conversationId}`,
+      {
+        timeout: 5000,
+        auth: {
+          username: `${process.env.ZENDESK_EMAIL}/token`,
+          password: process.env.ZENDESK_API_TOKEN
+        }
+      }
+    );
+    
+    const tickets = ticketRes.data.results;
+    if (tickets && tickets.length > 0) {
+      const ticketId = tickets[0].id;
+      await axios.put(
+        `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
+        {
+          ticket: {
+            tags: ['live_agent_requested']
+          }
+        },
+        {
+          timeout: 5000,
+          auth: {
+            username: `${process.env.ZENDESK_EMAIL}/token`,
+            password: process.env.ZENDESK_API_TOKEN
+          }
+        }
+      );
+      console.log('✅ Live agent tag added to ticket');
+    }
   } catch (error) {
-    console.error('❌ Failed to send choice message:', error.response?.data || error.message);
+    console.log('⚠️ Error handling agent request:', error.message);
   }
-}
-
-// Check if this is likely a first message
-function isFirstMessage(userMessage) {
-  const firstMessagePatterns = [
-    /^(hi|hello|hey|help|support|question|issue)/i,
-    /^.{1,20}$/  // Very short messages are often greetings
-  ];
-  
-  return firstMessagePatterns.some(pattern => pattern.test(userMessage.trim()));
 }
 
 app.get('/', (req, res) => {
@@ -304,9 +270,6 @@ app.post('/webhook', async (req, res) => {
       const conversationId = event.payload.conversation.id;
       const userId = event.payload.message.author.userId;
       const messageId = event.payload.message.id;
-      
-      // Check for postback payload (button clicks)
-      const postbackPayload = event.payload.message?.content?.payload;
 
       console.log('🔍 Processing message details:', {
         conversationId,
@@ -314,106 +277,20 @@ app.post('/webhook', async (req, res) => {
         messageId,
         timestamp: new Date().toISOString(),
         messagePreview: userMessage?.substring(0, 100),
-        postbackPayload: postbackPayload,
         authorType: event.payload.message.author.type,
         displayName: event.payload.message.author.displayName
       });
-
-      // Handle button clicks
-      if (postbackPayload) {
-        if (postbackPayload === 'live_agent') {
-          console.log('👤 User requested live agent via button');
-          // Send confirmation message
-          await axios.post(
-            `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
-            {
-              author: { type: 'business' },
-              content: { 
-                type: 'text', 
-                text: "I'll connect you with a live agent. Please wait a moment while I transfer your conversation." 
-              }
-            },
-            {
-              timeout: 10000,
-              headers: {
-                Authorization: `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-          
-          // Add live agent tag to the ticket
-          try {
-            const ticketRes = await axios.get(
-              `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket external_id:${conversationId}`,
-              {
-                timeout: 5000,
-                auth: {
-                  username: `${process.env.ZENDESK_EMAIL}/token`,
-                  password: process.env.ZENDESK_API_TOKEN
-                }
-              }
-            );
-            
-            const tickets = ticketRes.data.results;
-            if (tickets && tickets.length > 0) {
-              const ticketId = tickets[0].id;
-              await axios.put(
-                `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
-                {
-                  ticket: {
-                    tags: ['live_agent_requested']
-                  }
-                },
-                {
-                  timeout: 5000,
-                  auth: {
-                    username: `${process.env.ZENDESK_EMAIL}/token`,
-                    password: process.env.ZENDESK_API_TOKEN
-                  }
-                }
-              );
-              console.log('✅ Live agent tag added to ticket');
-            }
-          } catch (tagError) {
-            console.log('⚠️ Error adding live agent tag:', tagError.message);
-          }
-          
-          continue; // Skip AI response
-        } else if (postbackPayload === 'ai_assistant') {
-          console.log('🤖 User chose AI assistant via button');
-          // Send confirmation and continue with AI below
-          await axios.post(
-            `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
-            {
-              author: { type: 'business' },
-              content: { 
-                type: 'text', 
-                text: "Perfect! I'm here to help. What can I assist you with today?" 
-              }
-            },
-            {
-              timeout: 10000,
-              headers: {
-                Authorization: `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-          continue; // Wait for their next message
-        }
-      }
 
       if (!userMessage || !conversationId) {
         console.log('❌ Missing required data - skipping');
         continue;
       }
 
-      // Check if this conversation hasn't been shown the choice and looks like a first message
-      if (!conversationChoices.has(conversationId) && isFirstMessage(userMessage)) {
-        console.log('🔄 Sending choice message for new conversation');
-        await sendChoiceMessage(conversationId);
-        continue; // Don't process the message further, wait for their choice
+      // Check if user typed AGENT or wants live agent
+      if (detectAgentRequest(userMessage)) {
+        console.log('👤 User requested live agent via text');
+        await handleAgentRequest(conversationId);
+        continue; // Skip AI response
       }
 
       // Rate limiting check
@@ -422,8 +299,8 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
-      // Enhanced duplicate message detection
-      if (isDuplicateMessage(conversationId, userMessage, messageId)) {
+      // Message deduplication check
+      if (isDuplicateMessage(conversationId, userMessage)) {
         console.log('🚫 Duplicate message detected - skipping');
         continue;
       }
@@ -484,12 +361,6 @@ app.post('/webhook', async (req, res) => {
         }
       );
 
-      // Add error handling for OpenAI response
-      if (!openaiRes.data?.choices?.[0]?.message?.content) {
-        console.error('❌ Invalid OpenAI response structure:', openaiRes.data);
-        throw new Error('Invalid OpenAI response - no content found');
-      }
-
       const aiReply = openaiRes.data.choices[0].message.content;
       console.log('✅ AI Reply generated successfully');
       console.log('📝 Reply preview:', aiReply.substring(0, 100) + '...');
@@ -546,10 +417,9 @@ app.listen(PORT, () => {
   console.log('🛡️ Safety features enabled:');
   console.log('  ✅ Enhanced bot detection');
   console.log('  ✅ Rate limiting (5 msgs/min per user)');
-  console.log('  ✅ Message deduplication (60s window)');
+  console.log('  ✅ Message deduplication');
   console.log('  ✅ Circuit breaker (max 10 errors)');
   console.log('  ✅ Request timeouts');
   console.log('  ✅ Comprehensive logging');
-  console.log('  ✅ Environment variable validation');
-  console.log('  ✅ Choice buttons for AI/Live Agent selection');
+  console.log('  ✅ AGENT command detection for live support');
 });
