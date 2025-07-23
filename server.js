@@ -45,6 +45,7 @@ app.use(express.json({ verify: verifySignature }));
 // Safety measures - in-memory storage
 const userMessageCount = new Map();
 const recentMessages = new Set();
+const conversationChoices = new Set(); // Track conversations that have been shown the choice
 let errorCount = 0;
 const MAX_ERRORS = 10;
 
@@ -174,6 +175,61 @@ function isDuplicateMessage(conversationId, userMessage, messageId) {
   return false;
 }
 
+// Function to send choice message with buttons
+async function sendChoiceMessage(conversationId) {
+  const messagePayload = {
+    author: {
+      type: 'business'
+    },
+    content: {
+      type: 'text',
+      text: "Hi! How would you like to get help today?",
+      actions: [
+        {
+          type: "postback",
+          text: "🤖 AI Assistant",
+          payload: "ai_assistant"
+        },
+        {
+          type: "postback",
+          text: "👤 Live Agent",
+          payload: "live_agent"
+        }
+      ]
+    }
+  };
+
+  try {
+    await axios.post(
+      `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+      messagePayload,
+      {
+        timeout: 10000,
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    console.log('✅ Choice message sent!');
+    
+    // Mark this conversation as having received the choice
+    conversationChoices.add(conversationId);
+  } catch (error) {
+    console.error('❌ Failed to send choice message:', error.response?.data || error.message);
+  }
+}
+
+// Check if this is likely a first message
+function isFirstMessage(userMessage) {
+  const firstMessagePatterns = [
+    /^(hi|hello|hey|help|support|question|issue)/i,
+    /^.{1,20}$/  // Very short messages are often greetings
+  ];
+  
+  return firstMessagePatterns.some(pattern => pattern.test(userMessage.trim()));
+}
+
 app.get('/', (req, res) => {
   res.send('🤖 AI Chatbot server is running safely!');
 });
@@ -248,6 +304,9 @@ app.post('/webhook', async (req, res) => {
       const conversationId = event.payload.conversation.id;
       const userId = event.payload.message.author.userId;
       const messageId = event.payload.message.id;
+      
+      // Check for postback payload (button clicks)
+      const postbackPayload = event.payload.message?.content?.payload;
 
       console.log('🔍 Processing message details:', {
         conversationId,
@@ -255,13 +314,106 @@ app.post('/webhook', async (req, res) => {
         messageId,
         timestamp: new Date().toISOString(),
         messagePreview: userMessage?.substring(0, 100),
+        postbackPayload: postbackPayload,
         authorType: event.payload.message.author.type,
         displayName: event.payload.message.author.displayName
       });
 
+      // Handle button clicks
+      if (postbackPayload) {
+        if (postbackPayload === 'live_agent') {
+          console.log('👤 User requested live agent via button');
+          // Send confirmation message
+          await axios.post(
+            `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+            {
+              author: { type: 'business' },
+              content: { 
+                type: 'text', 
+                text: "I'll connect you with a live agent. Please wait a moment while I transfer your conversation." 
+              }
+            },
+            {
+              timeout: 10000,
+              headers: {
+                Authorization: `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+          
+          // Add live agent tag to the ticket
+          try {
+            const ticketRes = await axios.get(
+              `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket external_id:${conversationId}`,
+              {
+                timeout: 5000,
+                auth: {
+                  username: `${process.env.ZENDESK_EMAIL}/token`,
+                  password: process.env.ZENDESK_API_TOKEN
+                }
+              }
+            );
+            
+            const tickets = ticketRes.data.results;
+            if (tickets && tickets.length > 0) {
+              const ticketId = tickets[0].id;
+              await axios.put(
+                `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
+                {
+                  ticket: {
+                    tags: ['live_agent_requested']
+                  }
+                },
+                {
+                  timeout: 5000,
+                  auth: {
+                    username: `${process.env.ZENDESK_EMAIL}/token`,
+                    password: process.env.ZENDESK_API_TOKEN
+                  }
+                }
+              );
+              console.log('✅ Live agent tag added to ticket');
+            }
+          } catch (tagError) {
+            console.log('⚠️ Error adding live agent tag:', tagError.message);
+          }
+          
+          continue; // Skip AI response
+        } else if (postbackPayload === 'ai_assistant') {
+          console.log('🤖 User chose AI assistant via button');
+          // Send confirmation and continue with AI below
+          await axios.post(
+            `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
+            {
+              author: { type: 'business' },
+              content: { 
+                type: 'text', 
+                text: "Perfect! I'm here to help. What can I assist you with today?" 
+              }
+            },
+            {
+              timeout: 10000,
+              headers: {
+                Authorization: `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+          continue; // Wait for their next message
+        }
+      }
+
       if (!userMessage || !conversationId) {
         console.log('❌ Missing required data - skipping');
         continue;
+      }
+
+      // Check if this conversation hasn't been shown the choice and looks like a first message
+      if (!conversationChoices.has(conversationId) && isFirstMessage(userMessage)) {
+        console.log('🔄 Sending choice message for new conversation');
+        await sendChoiceMessage(conversationId);
+        continue; // Don't process the message further, wait for their choice
       }
 
       // Rate limiting check
@@ -399,4 +551,5 @@ app.listen(PORT, () => {
   console.log('  ✅ Request timeouts');
   console.log('  ✅ Comprehensive logging');
   console.log('  ✅ Environment variable validation');
+  console.log('  ✅ Choice buttons for AI/Live Agent selection');
 });
