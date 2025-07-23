@@ -10,6 +10,7 @@ app.use(express.json({ verify: verifySignature }));
 // Safety measures - in-memory storage
 const userMessageCount = new Map();
 const recentMessages = new Set();
+const agentRequests = new Set(); // Track conversations that requested live agents
 let errorCount = 0;
 const MAX_ERRORS = 10;
 
@@ -124,17 +125,16 @@ function isDuplicateMessage(conversationId, userMessage) {
 function detectAgentRequest(userMessage) {
   const message = userMessage.toLowerCase().trim();
   
-  // Check for exact AGENT command or common variations
-  return (
-    message === 'agent' ||
-    message === 'live agent' ||
-    message === 'human' ||
-    message === 'person' ||
-    message.includes('speak with agent') ||
-    message.includes('talk to agent') ||
-    message.includes('live support') ||
-    message.includes('human help')
-  );
+  // Only exact "LIVE AGENT" to match Zendesk trigger
+  return message === 'live agent';
+}
+
+// Function to detect if user wants AI back
+function detectAIRequest(userMessage) {
+  const message = userMessage.toLowerCase().trim();
+  
+  // Only exact "AI SUPPORT" to match Zendesk trigger
+  return message === 'ai support';
 }
 
 // Function to handle live agent request
@@ -147,7 +147,7 @@ async function handleAgentRequest(conversationId) {
         author: { type: 'business' },
         content: { 
           type: 'text', 
-          text: "I'm connecting you with a live agent. Someone will be with you shortly!" 
+          text: "I'm connecting you with a live agent. Someone will be with you shortly!\n\nIf you'd like to switch back to AI assistance at any time, just type \"AI SUPPORT\"." 
         }
       },
       {
@@ -159,40 +159,41 @@ async function handleAgentRequest(conversationId) {
       }
     );
     
-    // Add live agent tag to the ticket
-    const ticketRes = await axios.get(
-      `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket external_id:${conversationId}`,
+    // Remember this conversation requested live agent
+    agentRequests.add(conversationId);
+    console.log('✅ Live agent requested and tracked');
+  } catch (error) {
+    console.log('⚠️ Error handling agent request:', error.message);
+  }
+}
+
+// Function to handle switch back to AI
+async function handleAIRequest(conversationId) {
+  try {
+    // Send confirmation message
+    await axios.post(
+      `https://api.smooch.io/v2/apps/${process.env.ZENDESK_APP_ID}/conversations/${conversationId}/messages`,
       {
-        timeout: 5000,
-        auth: {
-          username: `${process.env.ZENDESK_EMAIL}/token`,
-          password: process.env.ZENDESK_API_TOKEN
+        author: { type: 'business' },
+        content: { 
+          type: 'text', 
+          text: "I'm back to help! What can I assist you with?" 
+        }
+      },
+      {
+        timeout: 10000,
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${process.env.ZENDESK_KEY_ID}:${process.env.ZENDESK_SECRET_KEY}`).toString('base64')}`,
+          'Content-Type': 'application/json'
         }
       }
     );
     
-    const tickets = ticketRes.data.results;
-    if (tickets && tickets.length > 0) {
-      const ticketId = tickets[0].id;
-      await axios.put(
-        `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticketId}.json`,
-        {
-          ticket: {
-            tags: ['live_agent_requested']
-          }
-        },
-        {
-          timeout: 5000,
-          auth: {
-            username: `${process.env.ZENDESK_EMAIL}/token`,
-            password: process.env.ZENDESK_API_TOKEN
-          }
-        }
-      );
-      console.log('✅ Live agent tag added to ticket');
-    }
+    // Remove from agent requests - back to AI mode
+    agentRequests.delete(conversationId);
+    console.log('✅ Switched back to AI mode');
   } catch (error) {
-    console.log('⚠️ Error handling agent request:', error.message);
+    console.log('⚠️ Error handling AI request:', error.message);
   }
 }
 
@@ -293,6 +294,19 @@ app.post('/webhook', async (req, res) => {
         continue; // Skip AI response
       }
 
+      // Check if user wants to switch back to AI
+      if (detectAIRequest(userMessage)) {
+        console.log('🤖 User requested to switch back to AI Support');
+        await handleAIRequest(conversationId);
+        continue; // Skip further processing, wait for next message
+      }
+
+      // Skip AI responses if user has requested live agent
+      if (agentRequests.has(conversationId)) {
+        console.log('🙋‍♂️ Live agent mode active - skipping AI response');
+        continue;
+      }
+
       // Rate limiting check
       if (isRateLimited(userId)) {
         console.log('🚫 Rate limit exceeded for user:', userId);
@@ -306,34 +320,7 @@ app.post('/webhook', async (req, res) => {
       }
 
       // Check if conversation has live_agent_requested tag
-      console.log('🏷️ Checking for live agent tag...');
-      try {
-        const ticketRes = await axios.get(
-          `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket external_id:${conversationId}`,
-          {
-            timeout: 5000,
-            auth: {
-              username: `${process.env.ZENDESK_EMAIL}/token`,
-              password: process.env.ZENDESK_API_TOKEN
-            }
-          }
-        );
-
-        const tickets = ticketRes.data.results;
-        if (tickets && tickets.length > 0) {
-          const ticket = tickets[0];
-          if (ticket.tags && ticket.tags.includes('live_agent_requested')) {
-            console.log('🙋‍♂️ Live agent requested - skipping AI response');
-            continue;
-          }
-          console.log('✅ No live agent tag found - proceeding with AI response');
-        } else {
-          console.log('ℹ️ No associated ticket found - proceeding with AI response');
-        }
-      } catch (tagCheckError) {
-        console.log('⚠️ Error checking tags, proceeding with AI response:', tagCheckError.message);
-        // Continue with AI response if tag check fails
-      }
+      // Removed - using in-memory tracking instead of Zendesk API calls
 
       // Build system prompt with support docs
       const systemPrompt = buildSystemPrompt(userMessage);
@@ -421,5 +408,5 @@ app.listen(PORT, () => {
   console.log('  ✅ Circuit breaker (max 10 errors)');
   console.log('  ✅ Request timeouts');
   console.log('  ✅ Comprehensive logging');
-  console.log('  ✅ AGENT command detection for live support');
+  console.log('  ✅ LIVE AGENT/AI SUPPORT text switching for live support');
 });
